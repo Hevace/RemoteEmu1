@@ -24,7 +24,6 @@ namespace RemoteEmu1
         private void RemoteEmu1Form_FormClosing(object sender, FormClosingEventArgs e)
         {
             Console.Close();
-            Console.Dispose();
         }
     }
 }

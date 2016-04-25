@@ -4,29 +4,143 @@ using System.Text;
 using System.Net;
 using System.Net.Sockets;
 using System.Diagnostics;
+using System.Collections.Concurrent;
+using System.ComponentModel;
+using System.Threading;
 
 namespace RemoteEmu1
 {
+    /// <summary>
+    /// I/O for each connected client
+    /// </summary>
+    class ScriptConsoleClient
+    {
+        TcpClient Client;                   // the client and its I/O stream
+        ScriptConsole Server;               // TCP console server
+        StringBuilder InStr;                // the incoming command line
+        byte[] Buffer;                      // bytes received on each read
+        bool IsSending;                     // true if an async send is in progress
+        bool IsClosed;                      // true if Close method has been called
+
+        public IPAddress IpAddr
+        {
+            get
+            {
+                return ((IPEndPoint)Client.Client.RemoteEndPoint).Address;
+            }
+        }
+
+        public int Port
+        {
+            get
+            {
+                return ((IPEndPoint)Client.Client.RemoteEndPoint).Port;
+            }
+        }
+
+        private ScriptConsoleClient() { }            // must provide a client
+
+        public ScriptConsoleClient(TcpClient newTcpClient, ScriptConsole server)
+        {
+            Client = newTcpClient;
+            Server = server;
+            InStr = new StringBuilder();
+            Buffer = new byte[Client.ReceiveBufferSize];
+            IsSending = false;
+            IsClosed = false;
+        }
+
+        public void Close()
+        {
+            IsClosed = true;            // start discarding input from async i/o
+            for (int i = 0; i < 20 && IsSending; i++)
+            {
+                // wait for the send to complete
+                System.Threading.Thread.Sleep(100);
+            }
+            Client.GetStream().Close();
+            Client.Close();
+        }
+
+        public void BeginRead()
+        {
+            if (IsClosed) return;
+            // start listening for input
+            Client.GetStream().BeginRead(Buffer, 0, Buffer.Length, OnReceive, this);
+        }
+
+        void OnReceive(IAsyncResult ar)
+        {
+            if (IsClosed) return;       // discard input if in the process of closing
+
+            // read the incoming bytes
+            var c = (ScriptConsoleClient)ar.AsyncState;
+            NetworkStream stream = c.Client.GetStream();
+            int numRead = stream.EndRead(ar);
+
+            if (numRead > 0)
+            {
+                // build the input string
+                c.InStr.Append(Encoding.ASCII.GetChars(c.Buffer, 0, numRead));
+                if (c.InStr.ToString().EndsWith(Environment.NewLine))
+                {
+                    string cmd = c.InStr.ToString().Trim();
+                    Server.SendCmd(this, cmd);              // submit the command for processing
+                    c.InStr.Clear();                        // start the next line input
+                }
+
+                // listen for the next input
+                stream.BeginRead(c.Buffer, 0, c.Buffer.Length, OnReceive, c);
+            }
+            else
+            {
+                // remote end has disconnected
+                Trace.WriteLine(string.Format("ScriptConsoleClient {0}:{1} is closing", ((IPEndPoint)c.Client.Client.RemoteEndPoint).Address, ((IPEndPoint)c.Client.Client.RemoteEndPoint).Port));
+                Close();
+                Server.SendDetach(this);        // notify console to remove from list of clients
+            }
+        }
+
+        public void BeginWrite(string outstr)
+        {
+            byte[] outbuf = Encoding.ASCII.GetBytes(outstr + Environment.NewLine);
+            IsSending = true;
+            Client.GetStream().BeginWrite(outbuf, 0, outbuf.Length, OnClientSend, this);
+        }
+
+        void OnClientSend(IAsyncResult ar)
+        {
+            var c = (ScriptConsoleClient)ar.AsyncState;
+            c.Client.GetStream().EndWrite(ar);
+            c.IsSending = false;
+        }
+    }
+
+    /// <summary>
+    /// TCP console that handles multiple simultaneous clients.
+    /// The console executes command strings received from clients and sends results to connected clients
+    /// </summary>
     class ScriptConsole : IDisposable
     {
         #region Private Types
-        /// <summary>
-        /// State data for each connected client
-        /// </summary>
-        struct ClientData
+        struct ScriptConsoleEvent
         {
-            public TcpClient Client;                    // the client and its I/O stream
-            public StringBuilder InStr;                 // the incoming command line
-            public byte[] Buffer;                       // bytes received on each read
-            public bool IsSending;                      // true if an async send is in progress
+            public enum EventType { ProcessCmd, DetachClient };
+            public EventType Type;
+            public string Cmd;
+            public ScriptConsoleClient SrcClient;
         }
         #endregion
 
         #region Private Data
         // TCP server communications
         TcpListener Console;                                // TCP console
-        List<ClientData> Client;                            // list of connected clients
+        List<ScriptConsoleClient> Client;                   // list of connected clients
         bool IsListening;                                   // indicates when console is not closed
+        // command processing queue
+        BlockingCollection<ScriptConsoleEvent> Clientq;     // queue of incoming commands and events from attached clients
+        BackgroundWorker Bw;                                // thread to service incoming commands and events
+        CancellationTokenSource TokenSource;                // creates token for stopping the processing queue
         // execution of commands
         Dictionary<string, IScriptableObject> ScriptObj;    // refs to objects that run commands
         // object support
@@ -38,36 +152,86 @@ namespace RemoteEmu1
         {
             // create the listener
             Console = new TcpListener(tcpEndPt);
-            Client = new List<ClientData>();              // start with empty list of connected clients
+            Client = new List<ScriptConsoleClient>();              // start with empty list of connected clients
             IsListening = true;
 
             ScriptObj = new Dictionary<string, IScriptableObject>();    // start with empty list of scriptable objects
 
+            // set up queue for incoming commands from clients
+            Clientq = new BlockingCollection<ScriptConsoleEvent>();
+            Bw = new BackgroundWorker();
+            Bw.WorkerSupportsCancellation = false;
+            Bw.WorkerReportsProgress = true;
+            TokenSource = new CancellationTokenSource();
+            CancellationToken token = TokenSource.Token;
+            Bw.DoWork += Console_DoWork;
+            Bw.RunWorkerAsync(token);
+
             // listen for connections
             Console.Start();
-            Console.BeginAcceptTcpClient(OnClientConnect, new object());
-
+            Console.BeginAcceptTcpClient(OnClientConnect, Console);
             Trace.WriteLine(string.Format("ScriptConsole listening on {0}:{1}", tcpEndPt.Address, tcpEndPt.Port));
         }
 
         public void Close()
         {
             // close the listener
-            Trace.WriteLine("ScriptConsole closing");
+            Trace.WriteLine("ScriptConsole Tcp listener closing");
             IsListening = false;
-            Console.Stop();
+            Console.Stop();             // All clients will close as the connection ends
 
-            foreach (var c in Client)
+            // shut down the command processing queue
+            TokenSource.Cancel();
+        }
+        #endregion
+
+        #region Command processing queue
+        void Console_DoWork(object sender, DoWorkEventArgs e)
+        {
+            Debug.WriteLine("Console command processing queue started");
+            var token = (CancellationToken)e.Argument;
+            try
             {
-                Trace.WriteLine(string.Format("ScriptConsole closing client at {0}:{1}", ((IPEndPoint)c.Client.Client.RemoteEndPoint).Address, ((IPEndPoint)c.Client.Client.RemoteEndPoint).Port));
-                for (int i = 0; i < 20 && c.IsSending; i++)
+                foreach (var evt in Clientq.GetConsumingEnumerable(token))
                 {
-                    // wait for the send to complete
-                    System.Threading.Thread.Sleep(100);
+                    Debug.WriteLine("Console command processing queue event received");
+                    switch (evt.Type)
+                    {
+                        case ScriptConsoleEvent.EventType.ProcessCmd:
+                            // parse the input string and execute the command
+                            string result = Parse(evt.Cmd);
+                            // send the input and the result to all clients
+                            SendResultToClients(evt.Cmd, result);
+                            break;
+                        case ScriptConsoleEvent.EventType.DetachClient:
+                            Client.Remove(evt.SrcClient);
+                            Trace.WriteLine("ScriptConsole removed client");
+                            break;
+                    }
                 }
-                c.Client.GetStream().Close();
-                c.Client.Close();
             }
+            catch (OperationCanceledException)
+            {
+                Debug.WriteLine("Console command processing queue exiting");
+            }
+        }
+
+        public void SendCmd(ScriptConsoleClient src, string cmd)
+        {
+            var evt = new ScriptConsoleEvent();
+            evt.Cmd = cmd;
+            evt.Type = ScriptConsoleEvent.EventType.ProcessCmd;
+            evt.SrcClient = src;
+            Clientq.Add(evt);
+        }
+
+        public void SendDetach(ScriptConsoleClient src)
+        {
+            var evt = new ScriptConsoleEvent();
+            evt.Cmd = null;
+            evt.Type = ScriptConsoleEvent.EventType.DetachClient;
+            evt.SrcClient = src;
+            Clientq.Add(evt);
         }
         #endregion
 
@@ -77,86 +241,27 @@ namespace RemoteEmu1
             if (!IsListening) return;       // refuse new connections if in the process of closing
 
             // accept the connection and add it to the list of clients
-            ClientData newClient;
-            newClient.Client = Console.EndAcceptTcpClient(ar);
-            newClient.InStr = new StringBuilder();
-            newClient.Buffer = new byte[newClient.Client.ReceiveBufferSize];
-            newClient.IsSending = false;
+            var listener = (TcpListener)ar.AsyncState;
+            TcpClient newTcpClient = listener.EndAcceptTcpClient(ar);
+            var newClient = new ScriptConsoleClient(newTcpClient, this);
             Client.Add(newClient);
-            Trace.WriteLine(string.Format("ScriptConsole added client at {0}:{1}", ((IPEndPoint)newClient.Client.Client.RemoteEndPoint).Address, ((IPEndPoint)newClient.Client.Client.RemoteEndPoint).Port));
+            Trace.WriteLine(string.Format("ScriptConsole added client at {0}:{1}", newClient.IpAddr, newClient.Port));
 
-            // start listening for input
-            NetworkStream stream = newClient.Client.GetStream();
-            stream.BeginRead(newClient.Buffer, 0, newClient.Buffer.Length, OnClientReceive, newClient);
+            // start listening for input from the new client
+            newClient.BeginRead();
+            newClient.BeginWrite("Attached to console");
 
             // listen for the next connection
-            Console.BeginAcceptTcpClient(OnClientConnect, new object());
-        }
-
-        void OnClientReceive(IAsyncResult ar)
-        {
-            if (!IsListening) return;       // discard input if in the process of closing
-
-            // read the incoming bytes
-            var cd = (ClientData)ar.AsyncState;
-            NetworkStream stream = cd.Client.GetStream();
-            int numRead = stream.EndRead(ar);
-
-            if (numRead > 0)
-            {
-                // build the input string
-                cd.InStr.Append(Encoding.ASCII.GetChars(cd.Buffer, 0, numRead));
-                if (cd.InStr.ToString().EndsWith(Environment.NewLine))
-                {
-                    string cmd = cd.InStr.ToString().Trim();
-                    // parse the input string and execute the command   // TODO run command in another thread
-                    string result = Parse(cmd);
-                    // send the input and the result to all clients
-                    SendResultToClients(cmd, result);
-                    // start the next line input
-                    cd.InStr.Clear();
-                }
-
-                // listen for the next input
-                stream.BeginRead(cd.Buffer, 0, cd.Buffer.Length, OnClientReceive, cd);
-            }
-            else
-            {
-                // remote end has disconnected
-                Trace.WriteLine(string.Format("ScriptConsole closing client at {0}:{1}", ((IPEndPoint)cd.Client.Client.RemoteEndPoint).Address, ((IPEndPoint)cd.Client.Client.RemoteEndPoint).Port));
-                for (int i = 0; i < 20 && cd.IsSending; i++)
-                {
-                    // wait for the send to complete
-                    System.Threading.Thread.Sleep(100);
-                }
-                cd.Client.GetStream().Close();
-                cd.Client.Close();
-                Client.Remove(cd);
-            }
-        }
-
-        void OnClientSend(IAsyncResult ar)
-        {
-            var cd = (ClientData)ar.AsyncState;
-            NetworkStream stream = cd.Client.GetStream();
-            stream.EndWrite(ar);
-            cd.IsSending = false;
+            Console.BeginAcceptTcpClient(OnClientConnect, Console);
         }
 
         void SendResultToClients(string input, string result)
         {
             if (!IsListening) return;           // don't start a new send if console is closing
-
-            byte[] inputBytes = Encoding.ASCII.GetBytes(input+Environment.NewLine);
-            byte[] resultBytes = Encoding.ASCII.GetBytes(result+Environment.NewLine);
-
-            for (int i = 0; i < Client.Count; i++)
+            foreach (ScriptConsoleClient c in Client)
             {
-                ClientData cd = Client[i];
-                cd.IsSending = true;
-                NetworkStream stream = cd.Client.GetStream();
-                stream.BeginWrite(inputBytes, 0, inputBytes.Length, OnClientSend, cd);
-                stream.BeginWrite(resultBytes, 0, resultBytes.Length, OnClientSend, cd);
+                c.BeginWrite(input);
+                c.BeginWrite(result);
             }
         }
         #endregion
@@ -169,7 +274,7 @@ namespace RemoteEmu1
 
         string Parse(string inputln)
         {
-            // TODO parse input command and run the command. Don't execute the command in the async NetworkStream receive thread
+            // TODO parse input command and run the command
             string [] tok = inputln.Split(new char[] { ' ' });
             return "Result: " + inputln;
         }
